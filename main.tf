@@ -246,9 +246,9 @@ resource "aws_iam_role_policy" "s3_models" {
         Resource = "arn:aws:s3:::${var.s3_models_bucket}"
       },
       {
-        Sid      = "ReadWriteModelObjects"
-        Effect   = "Allow"
-        Action   = [
+        Sid    = "ReadWriteModelObjects"
+        Effect = "Allow"
+        Action = [
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject"
