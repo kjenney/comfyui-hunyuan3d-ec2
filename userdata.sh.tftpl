@@ -69,6 +69,9 @@ cat > /opt/comfyui/provision.sh << 'PROVEOF'
 # Exits nonzero on failure so systemd restarts the unit and we retry.
 
 set -o pipefail
+# Never block on GitHub credential prompts during provisioning (e.g. if a
+# stale credential helper is present); a public HTTPS clone should be silent.
+export GIT_TERMINAL_PROMPT=0
 
 COMFYUI_HOME=/home/ec2-user/ComfyUI
 COMFYUI_VENV=$COMFYUI_HOME/venv
@@ -106,12 +109,15 @@ fi
 # --- 3. ComfyUI source -----------------------------------------------------
 if [ ! -d "$COMFYUI_HOME/.git" ]; then
     mkdir -p "$(dirname "$COMFYUI_HOME")"
-    retry 5 git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_HOME" || die "ComfyUI clone failed"
+    rm -rf "$COMFYUI_HOME"   # clear a partial clone left by a failed/aborted run
+    retry 5 git -c credential.helper= clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_HOME" || die "ComfyUI clone failed"
 fi
 
 # --- 4. Python virtualenv ---------------------------------------------------
+# Use python3.11 explicitly: ComfyUI deps (e.g. av>=17.0.0) require >=3.11,
+# while the default `python3` on Amazon Linux is 3.9.
 if [ ! -x "$COMFYUI_VENV/bin/python" ]; then
-    python3 -m venv "$COMFYUI_VENV" || die "venv creation failed"
+    python3.11 -m venv "$COMFYUI_VENV" || die "venv creation failed"
 fi
 # shellcheck source=/dev/null
 source "$COMFYUI_VENV/bin/activate"
@@ -126,33 +132,40 @@ retry 3 python -m pip install -r "$COMFYUI_HOME/requirements.txt" || die "ComfyU
 # --- 6. ComfyUI-Manager ----------------------------------------------------
 if [ ! -d "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager/.git" ]; then
     mkdir -p "$COMFYUI_CUSTOM_NODES"
-    retry 5 git clone https://github.com/comfyanonymous/ComfyUI-Manager.git "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager" || die "ComfyUI-Manager clone failed"
+    rm -rf "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager"   # clear a partial clone
+    retry 5 git -c credential.helper= clone --depth 1 https://github.com/comfy-org/ComfyUI-Manager.git "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager" || die "ComfyUI-Manager clone failed"
 fi
 retry 3 python -m pip install -r "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager/requirements.txt" || die "ComfyUI-Manager deps install failed"
 
 # --- 7. Models (only downloaded when missing) --------------------------------
-python -m pip install -q huggingface_hub
+python -m pip install -q -U huggingface_hub   # ensure the `hf` CLI exists (replaces deprecated `huggingface-cli`)
 if [ -n "$HF_TOKEN" ]; then
-    huggingface-cli login --token "$HF_TOKEN"
+    hf auth login --token "$HF_TOKEN"
 fi
 
 MODELS=$COMFYUI_HOME/models
 mkdir -p "$MODELS/checkpoints" "$MODELS/clip_vision" "$MODELS/hy3dpaint/ckpt"
 
-# fetch <url> <dest> — -s checks non-empty file so a failed wget retries next boot
-fetch() { [ -s "$2" ] || retry 3 wget -q -O "$2" "$1" || { rm -f "$2"; die "download failed: $2"; }; }
+# fetch_generic <url> <dest> — for non-HF hosts; -s checks non-empty so a
+# failed wget retries next boot
+fetch_generic() { [ -s "$2" ] || retry 3 wget -q -O "$2" "$1" || { rm -f "$2"; die "download failed: $2"; }; }
 
-fetch "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/hunyuan_3d_v$${MODEL_VERSION}.safetensors" \
-      "$MODELS/checkpoints/hunyuan_3d_v$${MODEL_VERSION}.safetensors"
-fetch "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_mv_repackaged/resolve/main/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors" \
-      "$MODELS/checkpoints/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors"
-fetch "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/clip_vision_g.safetensors" \
-      "$MODELS/clip_vision/clip_vision_g.safetensors"
-fetch "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
+# hf_fetch <repo> <file> <dest-dir> — single-file HF download via `hf` CLI.
+# Why not wget: HF blocks/429s anonymous wget on model files; `hf` sends a
+# proper User-Agent and authenticates with the token logged in above.
+hf_fetch() {
+    [ -s "$3/$(basename "$2")" ] && return 0
+    retry 3 hf download "$1" "$2" --local-dir "$3" || { rm -f "$3/$(basename "$2")"; die "download failed: $3/$(basename "$2")"; }
+}
+
+hf_fetch "Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged" "hunyuan_3d_v$${MODEL_VERSION}.safetensors" "$MODELS/checkpoints"
+hf_fetch "Comfy-Org/hunyuan3D_$${MODEL_VERSION}_mv_repackaged" "hunyuan3d_v$${MODEL_VERSION}_mv.safetensors" "$MODELS/checkpoints"
+hf_fetch "Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged" "clip_vision_g.safetensors" "$MODELS/clip_vision"
+fetch_generic "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
       "$MODELS/hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
 
 if [ -n "$HF_TOKEN" ] && [ ! -d "$MODELS/hunyuan3d-paint-v$${MODEL_VERSION}" ]; then
-    retry 3 huggingface-cli download "tencent/Hunyuan3D-$${MODEL_VERSION}" \
+    retry 3 hf download "tencent/Hunyuan3D-$${MODEL_VERSION}" \
         --include "hunyuan3d-paint-v$${MODEL_VERSION}/*" \
         --local-dir "$MODELS" || die "Hunyuan3D paint model download failed"
 fi
