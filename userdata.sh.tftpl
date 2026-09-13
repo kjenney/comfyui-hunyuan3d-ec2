@@ -1,0 +1,186 @@
+#!/bin/bash
+# ComfyUI + Hunyuan3D EC2 User Data Script
+
+set -xe
+
+# ============================================================
+# Configuration
+# ============================================================
+
+COMFYUI_PORT=8188
+COMFYUI_USERDATA_FLAG=--low_vram_mode
+
+# Hugging Face token (set via Terraform variable)
+HF_TOKEN="${hf_token}"
+
+# Model version (set via Terraform variable)
+MODEL_VERSION="$MODEL_VERSION"
+
+# ============================================================
+# 1. Update system packages
+# ============================================================
+
+yum update
+yum upgrade -y
+dnf groupinstall -y "Development Tools"
+dnf install mesa-libGL libglvnd-glx -y
+yum install -y \
+    git \
+    python3.11 \
+    python3.11-pip \
+    wget \
+    unzip \
+    lsof \
+    net-tools \
+    xdg-utils
+
+# ============================================================
+# 2. Install NVIDIA drivers
+# ============================================================
+
+dnf install nvidia-release -y
+# 1. Extract the major version (e.g., 6.12 or 6.18)
+version=$(uname -r | grep -oP '^\d+\.\d+')
+
+# 2. Install the matching headers and development packages
+sudo dnf install -y kernel$${version}-headers-$(uname -r) kernel$${version}-devel-$(uname -r) kernel$${version}-modules-extra-$(uname -r)
+
+dnf install nvidia-driver-cuda -y
+reboot
+
+# Script execution pauses here until the instance reboots
+# ============================================================
+
+nvidia-smi -q > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "NVIDIA Driver verified successfully."
+else
+    echo "Verification failed. Check driver installation or kernel version mismatch."
+    exit 1
+fi
+
+# ============================================================
+# 3. Install CUDA Toolkit and cuDNN
+# ============================================================
+
+dnf install cuda-toolkit -y
+
+# ============================================================
+# 4. Create ComfyUI user and home directory
+# ============================================================
+
+COMFYUI_HOME="/home/ec2-user"
+COMFYUI_DIR="$COMFYUI_HOME/ComfyUI"
+COMFYUI_VENV="$COMFYUI_DIR/venv"
+COMFYUI_CUSTOM_NODES="$COMFYUI_DIR/custom_nodes"
+
+# ============================================================
+# 5. Install ComfyUI
+# ============================================================
+
+cd "$COMFYUI_HOME"
+git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_DIR"
+
+cd "$COMFYUI_DIR"
+python3 -m venv "$COMFYUI_VENV"
+source "$COMFYUI_VENV/bin/activate"
+
+pip install --upgrade pip wheel
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+pip install -r requirements.txt
+
+# ============================================================
+# 6. Install ComfyUI Manager
+# ============================================================
+
+cd "$COMFYUI_CUSTOM_NODES"
+git clone https://github.com/comfyanonymous/ComfyUI-Manager.git
+pip install -r ComfyUI-Manager/requirements.txt
+
+# ============================================================
+# 7. Download Hunyuan3D Models
+# ============================================================
+
+mkdir -p "$COMFYUI_DIR/models/checkpoints"
+mkdir -p "$COMFYUI_DIR/models/clip_vision"
+mkdir -p "$COMFYUI_DIR/models/hy3dpaint/ckpt"
+
+pip install huggingface_hub
+
+if [ -n "$HF_TOKEN" ]; then
+    huggingface-cli login --token "$HF_TOKEN"
+fi
+
+echo "Downloading Hunyuan3D $${MODEL_VERSION} shape model..."
+wget -O "$COMFYUI_DIR/models/checkpoints/hunyuan_3d_v$${MODEL_VERSION}.safetensors" \
+    "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/hunyuan_3d_v$${MODEL_VERSION}.safetensors"
+
+echo "Downloading Hunyuan3D $${MODEL_VERSION} MV model..."
+wget -O "$COMFYUI_DIR/models/checkpoints/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors" \
+    "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_mv_repackaged/resolve/main/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors"
+
+echo "Downloading CLIP Vision model..."
+wget -O "$COMFYUI_DIR/models/clip_vision/clip_vision_g.safetensors" \
+    "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/clip_vision_g.safetensors"
+
+echo "Downloading Hunyuan3D $${MODEL_VERSION} paint model..."
+huggingface-cli download tencent/Hunyuan3D-$${MODEL_VERSION} \
+    --include "hunyuan3d-paint-v$${MODEL_VERSION}/*" \
+    --local-dir "$COMFYUI_DIR/models/"
+
+echo "Downloading RealESRGAN weights..."
+wget -O "$COMFYUI_DIR/models/hy3dpaint/ckpt/RealESRGAN_x4plus.pth" \
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+
+# ============================================================
+# 8. Install Blender (required for texture painting)
+# ============================================================
+
+#yum install -y blender
+
+# ============================================================
+# 9. Create ComfyUI systemd service
+# ============================================================
+
+cat > /etc/systemd/system/comfyui.service << 'EOF'
+[Unit]
+Description=ComfyUI with Hunyuan3D
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/ComfyUI
+Environment="PATH=/usr/local/cuda-12.8/bin:/home/ec2-user/ComfyUI/venv/bin:/usr/local/cuda-12.8/lib64"
+ExecStart=/home/ec2-user/ComfyUI/venv/bin/python main.py --listen 0.0.0.0 --port 8188 --low_vram_mode
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ============================================================
+# 10. Enable and start the service
+# ============================================================
+
+systemctl daemon-reload
+systemctl enable comfyui
+systemctl start comfyui
+
+# Wait for ComfyUI to start
+sleep 15
+
+# Verify it's running
+if curl -s http://localhost:$COMFYUI_PORT/history > /dev/null 2>&1; then
+    echo "================================================"
+    echo "ComfyUI is ready at: http://$(curl -s ifconfig.me):$COMFYUI_PORT"
+    echo ""
+    echo "Generated models will be in: /home/ec2-user/ComfyUI/output/mesh/"
+    echo "================================================"
+else
+    echo "WARNING: ComfyUI may not have started. Check logs:"
+    echo "  journalctl -u comfyui -f"
+fi
