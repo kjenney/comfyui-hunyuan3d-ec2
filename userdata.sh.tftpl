@@ -1,5 +1,15 @@
 #!/bin/bash
 # ComfyUI + Hunyuan3D EC2 User Data Script
+#
+# This script does the root-level, one-time setup only:
+#   1. system packages
+#   2. NVIDIA driver, then reboot
+# The service below writes /opt/comfyui/provision.sh and a comfyui.service unit,
+# then enables that unit and reboots. After the reboot — and on EVERY later boot
+# — systemd runs provision.sh (as ExecStartPre) which validates the GPU and
+# idempotently installs CUDA, ComfyUI, dependencies, and models, then starts the
+# ComfyUI server. Provisioning is boot-driven instead of one-shot user data, so
+# the instance converges even after subsequent reboots and self-heals on failure.
 
 set -xe
 
@@ -12,9 +22,6 @@ COMFYUI_USERDATA_FLAG=--low_vram_mode
 
 # Hugging Face token (set via Terraform variable)
 HF_TOKEN="${hf_token}"
-
-# Model version (set via Terraform variable)
-MODEL_VERSION="$MODEL_VERSION"
 
 # ============================================================
 # 1. Update system packages
@@ -46,107 +53,120 @@ version=$(uname -r | grep -oP '^\d+\.\d+')
 sudo dnf install -y kernel$${version}-headers-$(uname -r) kernel$${version}-devel-$(uname -r) kernel$${version}-modules-extra-$(uname -r)
 
 dnf install nvidia-driver-cuda -y
-reboot
 
-# Script execution pauses here until the instance reboots
+# ============================================================
+# 3. Install systemd service + provisioner
+#    (everything ComfyUI needs is provisioned AFTER the reboot,
+#     on every boot, by comfyui.service)
 # ============================================================
 
-nvidia-smi -q > /dev/null 2>&1
-if [ $? -eq 0 ]; then
-    echo "NVIDIA Driver verified successfully."
-else
-    echo "Verification failed. Check driver installation or kernel version mismatch."
-    exit 1
+mkdir -p /opt/comfyui
+
+cat > /opt/comfyui/provision.sh << 'PROVEOF'
+#!/usr/bin/env bash
+# ComfyUI provisioner — validates + installs everything ComfyUI needs to run.
+# Idempotent; runs on every boot as ExecStartPre of comfyui.service.
+# Exits nonzero on failure so systemd restarts the unit and we retry.
+
+set -o pipefail
+
+COMFYUI_HOME=/home/ec2-user/ComfyUI
+COMFYUI_VENV=$COMFYUI_HOME/venv
+COMFYUI_CUSTOM_NODES=$COMFYUI_HOME/custom_nodes
+CUDA_INDEX_URL=https://download.pytorch.org/whl/cu128
+MODEL_VERSION="${model_version}"
+HF_TOKEN="${hf_token}"
+
+log() { echo "[comfyui-provision] $*"; }
+die() { log "FATAL: $*"; exit 1; }
+
+retry() {
+    local tries=$1; shift
+    local i
+    for i in $(seq 1 "$tries"); do
+        if "$@"; then
+            return 0
+        fi
+        log "attempt $i/$tries failed ($*); retrying in 15s"
+        sleep 15
+    done
+    return 1
+}
+
+# --- 1. GPU validation -----------------------------------------------------
+log "validating NVIDIA driver"
+nvidia-smi -q >/dev/null 2>&1 || die "NVIDIA driver not operational; check 'journalctl -u comfyui' or reboot"
+
+# --- 2. CUDA toolkit (needs root; ec2-user has passwordless sudo) ----------
+log "checking CUDA toolkit"
+if ! command -v nvcc >/dev/null 2>&1 && [ ! -x /usr/local/cuda/bin/nvcc ]; then
+    retry 3 sudo dnf install -y cuda-toolkit || die "cuda-toolkit install failed"
 fi
 
-# ============================================================
-# 3. Install CUDA Toolkit and cuDNN
-# ============================================================
+# --- 3. ComfyUI source -----------------------------------------------------
+if [ ! -d "$COMFYUI_HOME/.git" ]; then
+    mkdir -p "$(dirname "$COMFYUI_HOME")"
+    retry 5 git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_HOME" || die "ComfyUI clone failed"
+fi
 
-dnf install cuda-toolkit -y
-
-# ============================================================
-# 4. Create ComfyUI user and home directory
-# ============================================================
-
-COMFYUI_HOME="/home/ec2-user"
-COMFYUI_DIR="$COMFYUI_HOME/ComfyUI"
-COMFYUI_VENV="$COMFYUI_DIR/venv"
-COMFYUI_CUSTOM_NODES="$COMFYUI_DIR/custom_nodes"
-
-# ============================================================
-# 5. Install ComfyUI
-# ============================================================
-
-cd "$COMFYUI_HOME"
-git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_DIR"
-
-cd "$COMFYUI_DIR"
-python3 -m venv "$COMFYUI_VENV"
+# --- 4. Python virtualenv ---------------------------------------------------
+if [ ! -x "$COMFYUI_VENV/bin/python" ]; then
+    python3 -m venv "$COMFYUI_VENV" || die "venv creation failed"
+fi
+# shellcheck source=/dev/null
 source "$COMFYUI_VENV/bin/activate"
 
-pip install --upgrade pip wheel
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# --- 5. PyTorch + ComfyUI dependencies -------------------------------------
+if ! python -c "import torch" >/dev/null 2>&1; then
+    retry 3 python -m pip install --upgrade pip wheel || die "pip upgrade failed"
+    retry 3 python -m pip install torch torchvision torchaudio --index-url "$CUDA_INDEX_URL" || die "torch install failed"
+fi
+retry 3 python -m pip install -r "$COMFYUI_HOME/requirements.txt" || die "ComfyUI requirements install failed"
 
-pip install -r requirements.txt
+# --- 6. ComfyUI-Manager ----------------------------------------------------
+if [ ! -d "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager/.git" ]; then
+    mkdir -p "$COMFYUI_CUSTOM_NODES"
+    retry 5 git clone https://github.com/comfyanonymous/ComfyUI-Manager.git "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager" || die "ComfyUI-Manager clone failed"
+fi
+retry 3 python -m pip install -r "$COMFYUI_CUSTOM_NODES/ComfyUI-Manager/requirements.txt" || die "ComfyUI-Manager deps install failed"
 
-# ============================================================
-# 6. Install ComfyUI Manager
-# ============================================================
-
-cd "$COMFYUI_CUSTOM_NODES"
-git clone https://github.com/comfyanonymous/ComfyUI-Manager.git
-pip install -r ComfyUI-Manager/requirements.txt
-
-# ============================================================
-# 7. Download Hunyuan3D Models
-# ============================================================
-
-mkdir -p "$COMFYUI_DIR/models/checkpoints"
-mkdir -p "$COMFYUI_DIR/models/clip_vision"
-mkdir -p "$COMFYUI_DIR/models/hy3dpaint/ckpt"
-
-pip install huggingface_hub
-
+# --- 7. Models (only downloaded when missing) --------------------------------
+python -m pip install -q huggingface_hub
 if [ -n "$HF_TOKEN" ]; then
     huggingface-cli login --token "$HF_TOKEN"
 fi
 
-echo "Downloading Hunyuan3D $${MODEL_VERSION} shape model..."
-wget -O "$COMFYUI_DIR/models/checkpoints/hunyuan_3d_v$${MODEL_VERSION}.safetensors" \
-    "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/hunyuan_3d_v$${MODEL_VERSION}.safetensors"
+MODELS=$COMFYUI_HOME/models
+mkdir -p "$MODELS/checkpoints" "$MODELS/clip_vision" "$MODELS/hy3dpaint/ckpt"
 
-echo "Downloading Hunyuan3D $${MODEL_VERSION} MV model..."
-wget -O "$COMFYUI_DIR/models/checkpoints/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors" \
-    "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_mv_repackaged/resolve/main/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors"
+# fetch <url> <dest> — -s checks non-empty file so a failed wget retries next boot
+fetch() { [ -s "$2" ] || retry 3 wget -q -O "$2" "$1" || { rm -f "$2"; die "download failed: $2"; }; }
 
-echo "Downloading CLIP Vision model..."
-wget -O "$COMFYUI_DIR/models/clip_vision/clip_vision_g.safetensors" \
-    "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/clip_vision_g.safetensors"
+fetch "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/hunyuan_3d_v$${MODEL_VERSION}.safetensors" \
+      "$MODELS/checkpoints/hunyuan_3d_v$${MODEL_VERSION}.safetensors"
+fetch "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_mv_repackaged/resolve/main/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors" \
+      "$MODELS/checkpoints/hunyuan3d_v$${MODEL_VERSION}_mv.safetensors"
+fetch "https://huggingface.co/Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged/resolve/main/clip_vision_g.safetensors" \
+      "$MODELS/clip_vision/clip_vision_g.safetensors"
+fetch "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
+      "$MODELS/hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
 
-echo "Downloading Hunyuan3D $${MODEL_VERSION} paint model..."
-huggingface-cli download tencent/Hunyuan3D-$${MODEL_VERSION} \
-    --include "hunyuan3d-paint-v$${MODEL_VERSION}/*" \
-    --local-dir "$COMFYUI_DIR/models/"
+if [ -n "$HF_TOKEN" ] && [ ! -d "$MODELS/hunyuan3d-paint-v$${MODEL_VERSION}" ]; then
+    retry 3 huggingface-cli download "tencent/Hunyuan3D-$${MODEL_VERSION}" \
+        --include "hunyuan3d-paint-v$${MODEL_VERSION}/*" \
+        --local-dir "$MODELS" || die "Hunyuan3D paint model download failed"
+fi
 
-echo "Downloading RealESRGAN weights..."
-wget -O "$COMFYUI_DIR/models/hy3dpaint/ckpt/RealESRGAN_x4plus.pth" \
-    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-
-# ============================================================
-# 8. Install Blender (required for texture painting)
-# ============================================================
-
-#yum install -y blender
-
-# ============================================================
-# 9. Create ComfyUI systemd service
-# ============================================================
+# --- 8. Done ----------------------------------------------------------------
+log "provision complete"
+PROVEOF
+chmod 0755 /opt/comfyui/provision.sh
 
 cat > /etc/systemd/system/comfyui.service << 'EOF'
 [Unit]
 Description=ComfyUI with Hunyuan3D
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -154,33 +174,25 @@ User=ec2-user
 Group=ec2-user
 WorkingDirectory=/home/ec2-user/ComfyUI
 Environment="PATH=/usr/local/cuda-12.8/bin:/home/ec2-user/ComfyUI/venv/bin:/usr/local/cuda-12.8/lib64"
+# Provision/validate on every start: idempotent, self-healing on failure.
+ExecStartPre=/opt/comfyui/provision.sh
 ExecStart=/home/ec2-user/ComfyUI/venv/bin/python main.py --listen 0.0.0.0 --port 8188 --low_vram_mode
 Restart=on-failure
-RestartSec=10
+RestartSec=15
+# First-start provisioning (CUDA + torch + models) is slow; don't time it out.
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ============================================================
-# 10. Enable and start the service
-# ============================================================
-
 systemctl daemon-reload
+# Enable now; systemd starts the unit on its own after the reboot below.
 systemctl enable comfyui
-systemctl start comfyui
 
-# Wait for ComfyUI to start
-sleep 15
+# ============================================================
+# 4. Reboot — NVIDIA driver takes effect, then comfyui.service
+#    provisions and brings ComfyUI up on every boot.
+# ============================================================
 
-# Verify it's running
-if curl -s http://localhost:$COMFYUI_PORT/history > /dev/null 2>&1; then
-    echo "================================================"
-    echo "ComfyUI is ready at: http://$(curl -s ifconfig.me):$COMFYUI_PORT"
-    echo ""
-    echo "Generated models will be in: /home/ec2-user/ComfyUI/output/mesh/"
-    echo "================================================"
-else
-    echo "WARNING: ComfyUI may not have started. Check logs:"
-    echo "  journalctl -u comfyui -f"
-fi
+reboot

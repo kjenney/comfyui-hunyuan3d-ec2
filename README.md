@@ -60,11 +60,12 @@ terraform destroy
 - `main.tf` — EC2 instance, VPC, security group, IAM, user data
 - `variables.tf` — configurable variables
 - `outputs.tf` — instance IP, URLs, SSH command
-- `userdata.sh.tftpl` — user data script template (Hunyuan3D models downloaded at launch)
+- `userdata.sh.tftpl` — user data script template (packages + NVIDIA driver; ComfyUI provisioning, models, and the server run via `comfyui.service` on every boot)
 
 ## Notes
 
 - The `lifecycle { ignore_changes = [user_data] }` block prevents Terraform from destroying and recreating the instance if the user data script changes — the script only runs at instance launch, not on updates.
+- ComfyUI installation, dependency validation, and model downloads are managed by `comfyui.service` (idempotent, runs on every boot). Inspect with `systemctl status comfyui` and `journalctl -u comfyui -f`.
 - If you need to update the user data, you'll need to destroy and recreate the instance.
 - The `ignore_changes` block also prevents accidental recreation if you change the `model_version` variable — in that case, destroy and recreate.
 - GPU instances may be AZ-limited. If your chosen AZ doesn't have the GPU type, change `availability_zone` in variables.tf.

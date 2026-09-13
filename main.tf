@@ -172,7 +172,7 @@ resource "aws_instance" "comfyui" {
 
   # User data script
   user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
-    hf_token     = var.hf_token
+    hf_token      = var.hf_token
     model_version = var.model_version
   }))
 
