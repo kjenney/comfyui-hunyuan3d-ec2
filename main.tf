@@ -230,3 +230,31 @@ resource "aws_iam_instance_profile" "comfyui" {
   name = "comfyui-hunyuan3d"
   role = aws_iam_role.comfyui.name
 }
+
+# S3 read/write access to the models bucket for the instance profile
+resource "aws_iam_role_policy" "s3_models" {
+  name = "s3-models-read-write"
+  role = aws_iam_role.comfyui.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ListModelsBucket"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = "arn:aws:s3:::${var.s3_models_bucket}"
+      },
+      {
+        Sid    = "ReadWriteModelObjects"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ]
+        Resource = "arn:aws:s3:::${var.s3_models_bucket}/*"
+      }
+    ]
+  })
+}
