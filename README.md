@@ -55,12 +55,36 @@ Fill in the correct values for the variables.
 terraform destroy
 ```
 
+## Checking GPU Capacity
+
+GPU instances (g5/g6/g7) are capacity-constrained and can sit in `pending` for a long time if the AZ you picked has no room. EC2 has no public "free capacity" API, so `scripts/check-capacity.sh` approximates where capacity exists from two signals:
+
+1. **Offerings** — which AZs currently advertise each instance type (`describe-instance-type-offerings`). A type missing from an AZ can't be launched there, period.
+2. **Spot price vs on-demand** — current spot price vs the type's on-demand price (`describe-spot-price-history` + `pricing:get-products`). Spot supply is a good proxy for how contended the type+AZ is:
+   - `VERY TIGHT` (spot ≥ 100% of on-demand) — expect long waits
+   - `tight` (≥ 75%) — likely to get stuck pending
+   - `healthy` (35–75%) — usually places fine
+   - `plentiful` (< 35%) — no problem
+
+**Usage:**
+
+```bash
+./scripts/check-capacity.sh                          # us-east-1, all GPU types from variables.tf
+./scripts/check-capacity.sh us-east-1 g6.4xlarge     # single type
+./scripts/check-capacity.sh us-east-2 g6.4xlarge g5.4xlarge g6.12xlarge
+```
+
+**Required permissions:** `ec2:DescribeSpotPriceHistory`, `ec2:DescribeInstanceTypeOfferings`, `pricing:GetProducts`.
+
+If the instance is stuck in `creating`, run this first to find an AZ/type with real room, update `availability_zone`/`instance_type` in `variables.tf`, then re-apply.
+
 ## Files
 
 - `main.tf` — EC2 instance, VPC, security group, IAM, user data
 - `variables.tf` — configurable variables
 - `outputs.tf` — instance IP, URLs, SSH command
 - `userdata.sh.tftpl` — user data script template (packages + NVIDIA driver; ComfyUI provisioning, models, and the server run via `comfyui.service` on every boot)
+- `scripts/check-capacity.sh` — checks EC2 capacity pressure for GPU instance types by AZ (see above)
 
 ## Notes
 
