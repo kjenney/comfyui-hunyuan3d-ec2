@@ -214,11 +214,6 @@ resource "aws_launch_template" "comfyui" {
       Name = "comfyui-hunyuan3d"
     }
   }
-
-  # Prevent Terraform from churning instances on user_data change
-  lifecycle {
-    ignore_changes = [user_data]
-  }
 }
 
 resource "aws_autoscaling_group" "comfyui" {

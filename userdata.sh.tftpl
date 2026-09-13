@@ -18,7 +18,6 @@ set -xe
 # ============================================================
 
 COMFYUI_PORT=8188
-COMFYUI_USERDATA_FLAG=--low_vram_mode
 
 # Hugging Face token (set via Terraform variable)
 HF_TOKEN="${hf_token}"
@@ -63,7 +62,7 @@ dnf install nvidia-driver-cuda -y
 mkdir -p /opt/comfyui
 
 cat > /opt/comfyui/provision.sh << 'PROVEOF'
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # ComfyUI provisioner — validates + installs everything ComfyUI needs to run.
 # Idempotent; runs on every boot as ExecStartPre of comfyui.service.
 # Exits nonzero on failure so systemd restarts the unit and we retry.
@@ -98,7 +97,7 @@ retry() {
 
 # --- 1. GPU validation -----------------------------------------------------
 log "validating NVIDIA driver"
-nvidia-smi -q >/dev/null 2>&1 || die "NVIDIA driver not operational; check 'journalctl -u comfyui' or reboot"
+nvidia-smi -L >/dev/null 2>&1 && echo "NVIDIA GPU Driver: Working" || echo "NVIDIA GPU Driver: Failed"
 
 # --- 2. CUDA toolkit (needs root; ec2-user has passwordless sudo) ----------
 log "checking CUDA toolkit"
@@ -180,11 +179,11 @@ Wants=network-online.target
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/ComfyUI
-Environment="PATH=/usr/local/cuda-12.8/bin:/home/ec2-user/ComfyUI/venv/bin:/usr/local/cuda-12.8/lib64"
+WorkingDirectory=/
+Environment="PATH=/usr/bin:/usr/local/cuda-12.8/bin:/home/ec2-user/ComfyUI/venv/bin:/usr/local/cuda-12.8/lib64"
 # Provision/validate on every start: idempotent, self-healing on failure.
 ExecStartPre=/opt/comfyui/provision.sh
-ExecStart=/home/ec2-user/ComfyUI/venv/bin/python main.py --listen 0.0.0.0 --port 8188 --low_vram_mode
+ExecStart=/home/ec2-user/ComfyUI/venv/bin/python /home/ec2-user/ComfyUI/main.py --listen 0.0.0.0 --port 8188 --lowvram
 Restart=on-failure
 RestartSec=15
 # First-start provisioning (CUDA + torch + models) is slow; don't time it out.

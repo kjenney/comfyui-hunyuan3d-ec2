@@ -55,6 +55,15 @@ Fill in the correct values for the variables.
 terraform destroy
 ```
 
+## Troublehsooting ComfyUI Issues
+
+Use Journalctl:
+
+```
+export SYSTEMD_LESS="FRXMK"
+journalctl -u comfyui -n 10
+```
+
 ## Checking GPU Capacity
 
 GPU instances (g5/g6/g7) are capacity-constrained and can sit in `pending` for a long time if the AZ you picked has no room. EC2 has no public "free capacity" API, so `scripts/check-capacity.sh` approximates where capacity exists from two signals:
