@@ -4,6 +4,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     name: terraform validate
@@ -33,36 +36,9 @@ jobs:
         id: validate
         run: terraform validate -no-color
 
-      - name: Post status to PR
-        uses: actions/github-script@v7
-        if: always()
-        with:
-          script: |
-            const name = 'terraform validate';
-            const conclusions = {
-              'success': '✅ validate passed',
-              'failure': '❌ validate failed',
-              'cancelled': '🚫 cancelled',
-              'skipped': '⏭️ skipped',
-              'timed_out': '⏳ timed out',
-            };
-            const result =
-              '${{ steps.validate.outcome }}' === 'success' &&
-              '${{ steps.fmt.outcome }}' === 'success'
-                ? 'success'
-                : '${{ steps.validate.conclusion }}';
-            await github.rest.checks.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              name,
-              head_sha: context.sha,
-              status: 'completed',
-              conclusion: result === 'success' ? 'success' : 'failure',
-              output: {
-                title: conclusions[result] || result,
-                summary:
-                  '- **fmt**: ${{ steps.fmt.outcome }}\n' +
-                  '- **init**: ${{ steps.init.outcome }}\n' +
-                  '- **validate**: ${{ steps.validate.outcome }}',
-              },
-            });
+      # fmt check is non-blocking above so validate still runs; fail here if fmt failed
+      - name: Fail on fmt
+        if: steps.fmt.outcome == 'failure'
+        run: |
+          echo "::error::terraform fmt -check found formatting issues"
+          exit 1
