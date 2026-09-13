@@ -50,6 +50,16 @@ data "aws_ami" "al2023" {
   }
 }
 
+# Running instances launched by the ASG (for outputs)
+data "aws_instances" "comfyui" {
+  instance_state_names = ["running"]
+
+  filter {
+    name   = "tag:Name"
+    values = ["comfyui-hunyuan3d"]
+  }
+}
+
 # ============================================================
 # VPC
 # ============================================================
@@ -152,22 +162,44 @@ resource "aws_security_group" "comfyui" {
 }
 
 # ============================================================
-# User Data (from script)
+# Auto Scaling Group (launch template + ASG)
 # ============================================================
 
-resource "aws_instance" "comfyui" {
-  ami                    = data.aws_ami.al2023.id
-  instance_type          = var.instance_type
-  key_name               = var.key_name
-  subnet_id              = aws_subnet.comfyui.id
-  vpc_security_group_ids = [aws_security_group.comfyui.id]
-  iam_instance_profile   = aws_iam_instance_profile.comfyui.name
+resource "aws_launch_template" "comfyui" {
+  name          = "comfyui-hunyuan3d"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = var.instance_type
+  key_name      = var.key_name
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.comfyui.name
+  }
+
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.comfyui.id]
+  }
 
   # EBS root volume
-  root_block_device {
-    volume_size = var.ebs_volume_size_gb
-    volume_type = "gp3"
-    encrypted   = true
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = var.ebs_volume_size_gb
+      volume_type = "gp3"
+      encrypted   = true
+    }
+  }
+
+  # Additional volume when using Spot (kept for parity with prior config)
+  dynamic "block_device_mappings" {
+    for_each = var.use_spot ? [1] : []
+    content {
+      device_name = "/dev/sdf"
+      ebs {
+        volume_size = 100
+        volume_type = "gp3"
+      }
+    }
   }
 
   # User data script
@@ -176,28 +208,35 @@ resource "aws_instance" "comfyui" {
     model_version = var.model_version
   }))
 
-  # Spot instance configuration
-  dynamic "ebs_block_device" {
-    for_each = var.use_spot ? [1] : []
-    content {
-      device_name = "/dev/sdf"
-      volume_size = 100
-      volume_type = "gp3"
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "comfyui-hunyuan3d"
     }
   }
 
-  # Prevent Terraform from destroying the instance on user_data change
+  # Prevent Terraform from churning instances on user_data change
   lifecycle {
     ignore_changes = [user_data]
   }
+}
 
-  timeouts {
-    create = "10m"
-    delete = "10m"
+resource "aws_autoscaling_group" "comfyui" {
+  name                = "comfyui-hunyuan3d"
+  vpc_zone_identifier = [aws_subnet.comfyui.id]
+  desired_capacity    = 1
+  min_size            = 1
+  max_size            = 1
+
+  launch_template {
+    id      = aws_launch_template.comfyui.id
+    version = "$Latest"
   }
 
-  tags = {
-    Name = "comfyui-hunyuan3d"
+  tag {
+    key                 = "Name"
+    value               = "comfyui-hunyuan3d"
+    propagate_at_launch = true
   }
 }
 
