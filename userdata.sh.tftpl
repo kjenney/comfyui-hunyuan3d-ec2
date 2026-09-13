@@ -144,7 +144,7 @@ if [ -n "$HF_TOKEN" ]; then
 fi
 
 MODELS=$COMFYUI_HOME/models
-mkdir -p "$MODELS/checkpoints" "$MODELS/clip_vision" "$MODELS/hy3dpaint/ckpt"
+mkdir -p "$MODELS/diffusion_models" "$MODELS/hy3dpaint/ckpt"
 
 # fetch_generic <url> <dest> — for non-HF hosts; -s checks non-empty so a
 # failed wget retries next boot
@@ -158,17 +158,12 @@ hf_fetch() {
     retry 3 hf download "$1" "$2" --local-dir "$3" || { rm -f "$3/$(basename "$2")"; die "download failed: $3/$(basename "$2")"; }
 }
 
-hf_fetch "Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged" "hunyuan_3d_v$${MODEL_VERSION}.safetensors" "$MODELS/checkpoints"
-hf_fetch "Comfy-Org/hunyuan3D_$${MODEL_VERSION}_mv_repackaged" "hunyuan3d_v$${MODEL_VERSION}_mv.safetensors" "$MODELS/checkpoints"
-hf_fetch "Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged" "clip_vision_g.safetensors" "$MODELS/clip_vision"
+# Hunyuan3D 2.1 is one single-file checkpoint (bundles diffusion + text encoder
+# + VAE). Per Comfy-Org's README it goes in models/diffusion_models/. Unlike 2.0,
+# there are no separate multiview / clip_vision / paint downloads.
+hf_fetch "Comfy-Org/hunyuan3D_$${MODEL_VERSION}_repackaged" "hunyuan_3d_v$${MODEL_VERSION}.safetensors" "$MODELS/diffusion_models"
 fetch_generic "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
       "$MODELS/hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-
-if [ -n "$HF_TOKEN" ] && [ ! -d "$MODELS/hunyuan3d-paint-v$${MODEL_VERSION}" ]; then
-    retry 3 hf download "tencent/Hunyuan3D-$${MODEL_VERSION}" \
-        --include "hunyuan3d-paint-v$${MODEL_VERSION}/*" \
-        --local-dir "$MODELS" || die "Hunyuan3D paint model download failed"
-fi
 
 # --- 8. Done ----------------------------------------------------------------
 log "provision complete"
