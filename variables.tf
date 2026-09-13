@@ -69,6 +69,11 @@ variable "model_version" {
   default     = "2.1"
 }
 
+variable "s3_models_bucket" {
+  description = "S3 bucket the instance can read/write models to/from"
+  type        = string
+}
+
 variable "comfyui_port" {
   description = "Port for ComfyUI web interface"
   type        = number
